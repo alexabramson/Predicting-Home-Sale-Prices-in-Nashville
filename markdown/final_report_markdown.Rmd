@@ -1,0 +1,1224 @@
+---
+title: "Midterm Home Price Predictions"
+author: "Alex Abramson and Shuyan Hong"
+date: "November 11, 2018"
+output:
+  html_document: default
+  word_document: default
+  pdf_document: default
+---
+#Setup Stuff
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r more setup stuff, echo=FALSE, include=FALSE}
+library(readr)
+library(corrplot)
+library(caret) 
+library(AppliedPredictiveModeling)
+library(stargazer)
+library(tidyverse)
+library(sf)
+library(FNN)
+library(tigris)
+library(leaflet)
+library(readr)
+library(viridis)
+library(rvest)
+library(geosphere)
+library(geometry)
+library(rgdal)
+library(spatstat)
+library(xtable)
+library(RSocrata)  #For obtaining data from website using Socrata as a platform
+library(tidycensus)  #For obtaining census data (although Ken strongly recommends against using census data to power this regression)
+library(knitr)
+library(kableExtra)
+library(spdep)
+library(geojsonsf)
+library(broom)
+library(e1071)
+
+options(tigris_use_cache = TRUE)
+options(scipen = 999)
+
+possibleCensusVars <- load_variables(2016, "acs5", cache = TRUE)
+
+mapTheme <- function(base_size = 12) {
+  theme(
+    text = element_text( color = "black"),
+    plot.title = element_text(size = 14,colour = "black"),
+    plot.subtitle=element_text(face="italic"),
+    plot.caption=element_text(hjust=0),
+    axis.ticks = element_blank(),
+    panel.background = element_blank(),axis.title = element_blank(),
+    axis.text = element_blank(),
+    axis.title.x = element_blank(),
+    axis.title.y = element_blank(),
+    panel.grid.minor = element_blank(),
+    panel.border = element_rect(colour = "black", fill=NA, size=2)
+  )
+}
+```
+
+``` {r import dataset and set everything up with that, echo=FALSE, include=FALSE, cache=TRUE}
+train_and_test_student <- read_csv("~/MUSA/Fall/Applied_Spatial_Analysis/midterm_competition/midtermData_forStudents/midtermData_forStudents/train.and.test_student.csv", 
+                                          col_types = cols(CensusBlock = col_character(), 
+                                                                     CouncilDistrict = col_character(), 
+                                                                     LocationZip = col_character(), OwnerZip = col_character(), 
+                                                                     Zone_Assessor = col_character(), 
+                                                                     accountnumber_property = col_character()))
+
+
+# create sf field and 'geometry' column, add back lat and long as well
+train_and_test_student.sf = st_as_sf(train_and_test_student, coords = c("WGS1984X", "WGS1984Y"), 
+                                     crs = 4326)
+train_and_test_student.sf <- as.data.frame(subset(train_and_test_student.sf, select = c(1,56) ))
+train_and_test_student.sf <- train_and_test_student.sf %>% inner_join(train_and_test_student, by = "kenID")
+
+#Clear out OwnerAddress2 column since its all null
+train_and_test_student <- train_and_test_student.sf %>%
+  dplyr::select(-OwnerAddress2) %>%
+  mutate(bathsMinusHalfbaths = baths - halfbaths) %>%
+  mutate(halfbaths = as.numeric(halfbaths)) %>%
+  mutate(pricePerSF = if_else(sf_finished != 0, as.numeric(SalePrice/(sf_finished)),NULL))
+
+OnlySalesAndKeys <- as.data.frame(subset(train_and_test_student, select = c(1,4) ))
+OnlySalesAndKeys <- mutate(OnlySalesAndKeys, newIDnum = row_number())
+OnlySalesSingleFamilyAndKeys <- as.data.frame(subset(filter(train_and_test_student,train_and_test_student$LandUseFullDescription == "SINGLE FAMILY"), select = c(1,4) ))
+OnlySalesSingleFamilyAndKeys <- mutate(OnlySalesSingleFamilyAndKeys, newIDnum = row_number())
+OnlySalesCondoAndKeys <- as.data.frame(subset(filter(train_and_test_student,LandUseFullDescription == "RESIDENTIAL CONDO"), select = c(1,4) ))
+OnlySalesCondoAndKeys <- mutate(OnlySalesCondoAndKeys, newIDnum = row_number())
+
+OnlySalesPerSFAndKeys <- as.data.frame(subset(filter(train_and_test_student, train_and_test_student$sf_finished > 0 ), select = c(1,59) ))
+OnlySalesPerSFAndKeys <- mutate(OnlySalesPerSFAndKeys, newIDnum = row_number())
+OnlySalesPerSFSingleFamilyAndKeys <- as.data.frame(subset(filter(train_and_test_student, train_and_test_student$LandUseFullDescription == "SINGLE FAMILY" & train_and_test_student$sf_finished > 0 ), select = c(1,59) ))
+OnlySalesPerSFSingleFamilyAndKeys <- mutate(OnlySalesPerSFSingleFamilyAndKeys, newIDnum = row_number())
+OnlySalesPerSFCondoAndKeys <- as.data.frame(subset(filter(train_and_test_student, LandUseFullDescription == "RESIDENTIAL CONDO" & train_and_test_student$sf_finished > 0 ), select = c(1,59) ))
+OnlySalesPerSFCondoAndKeys <- mutate(OnlySalesPerSFCondoAndKeys, newIDnum = row_number())
+
+# Turn all null values into text strings saying "Is null"
+train_and_test_student$Building_Type[is.na(train_and_test_student$Building_Type)] <- "Is null"
+train_and_test_student$Story_Height[is.na(train_and_test_student$Story_Height)] <- "Is null"
+train_and_test_student$Exterior_Wall[is.na(train_and_test_student$Exterior_Wall)] <- "Is null"
+train_and_test_student$Grade[is.na(train_and_test_student$Grade)] <- "Is null"
+train_and_test_student$Frame[is.na(train_and_test_student$Frame)] <- "Is null"
+train_and_test_student$Phys_Depreciation[is.na(train_and_test_student$Phys_Depreciation)] <- "Is null"
+train_and_test_student$LandUseFullDescription[is.na(train_and_test_student$LandUseFullDescription)] <- "Is null"
+train_and_test_student$CensusBlock[is.na(train_and_test_student$CensusBlock)] <- "Is null"
+train_and_test_student$LandUseDescription[is.na(train_and_test_student$LandUseDescription)] <- "Is null"
+train_and_test_student$District[is.na(train_and_test_student$District)] <- "Is null"
+train_and_test_student$avgHtfl_building[is.na(train_and_test_student$avgHtfl_building)] <- "Is null"
+train_and_test_student$ac_sfyi[is.na(train_and_test_student$ac_sfyi)] <- "Is null"
+train_and_test_student$halfbaths[is.na(train_and_test_student$halfbaths)] <- "Is null"
+train_and_test_student$HeatingType[is.na(train_and_test_student$HeatingType)] <- "Is null"
+train_and_test_student$Fixtures[is.na(train_and_test_student$Fixtures)] <- "Is null"
+train_and_test_student$Foundation[is.na(train_and_test_student$Foundation)] <- "Is null"
+
+#Create matrix of lat long coords for home sales -- for calculating nearest neighbors of different sale building types
+HomeSalesXYMatrix <-
+  train_and_test_student %>%
+  dplyr::select(WGS1984X,WGS1984Y) %>%
+  mutate(WGS1984X = as.numeric(WGS1984X)) %>%
+  mutate(WGS1984Y = as.numeric(WGS1984Y)) %>%
+  as.matrix()
+HomeSalesXYMatrixSingleFamily <-
+  train_and_test_student %>%
+  filter(LandUseFullDescription == "SINGLE FAMILY") %>%
+  dplyr::select(WGS1984X,WGS1984Y) %>%
+  mutate(WGS1984X = as.numeric(WGS1984X)) %>%
+  mutate(WGS1984Y = as.numeric(WGS1984Y)) %>%
+  as.matrix()
+HomeSalesXYMatrixResidentialCondo <-
+  train_and_test_student %>%
+  filter(LandUseFullDescription == "RESIDENTIAL CONDO") %>%
+  dplyr::select(WGS1984X,WGS1984Y) %>%
+  mutate(WGS1984X = as.numeric(WGS1984X)) %>%
+  mutate(WGS1984Y = as.numeric(WGS1984Y)) %>%
+  as.matrix()
+
+#AND AGAIN FOR ONLY THOSE WHICH GIVE PER SQ FT: Create matrix of lat long coords for home sales -- for calculating nearest neighbors of different sale building types
+HomeSalesXYMatrixWithSqFt <-
+  train_and_test_student %>%
+  filter(LandUseFullDescription != "VACANT RESIDENTIAL LAND" & sf_finished > 0) %>%
+  dplyr::select(WGS1984X,WGS1984Y) %>%
+  mutate(WGS1984X = as.numeric(WGS1984X)) %>%
+  mutate(WGS1984Y = as.numeric(WGS1984Y)) %>%
+  as.matrix()
+HomeSalesXYMatrixSingleFamilyWithSqFt <-
+  train_and_test_student %>%
+  filter(train_and_test_student$LandUseFullDescription == "SINGLE FAMILY"& train_and_test_student$sf_finished >= 1 & is.null(train_and_test_student$sf_finished)== FALSE) %>%
+  dplyr::select(WGS1984X,WGS1984Y) %>%
+  mutate(WGS1984X = as.numeric(WGS1984X)) %>%
+  mutate(WGS1984Y = as.numeric(WGS1984Y)) %>%
+  as.matrix()
+HomeSalesXYMatrixResidentialCondoWithSqFt <-
+  train_and_test_student %>%
+  filter(LandUseFullDescription == "RESIDENTIAL CONDO"& sf_finished > 0) %>%
+  dplyr::select(WGS1984X,WGS1984Y) %>%
+  mutate(WGS1984X = as.numeric(WGS1984X)) %>%
+  mutate(WGS1984Y = as.numeric(WGS1984Y)) %>%
+  as.matrix()
+
+#CBD matrix
+CBDxcoord <- c(-86.779792)
+CBDycoord <- c(36.163499)
+CBDxy <- data.frame(CBDxcoord, CBDycoord)
+CBDPoint <- as.matrix(CBDxy)
+remove(CBDxcoord)
+remove(CBDycoord)
+remove(CBDxy)
+
+#Vanderbilt Matrix
+Vanderbiltxcoord <- c(-86.802853)
+Vanderbiltycoord <- c(36.144846)
+Vanderbiltxy <- data.frame(Vanderbiltxcoord, Vanderbiltycoord)
+VanderbiltPoint <- as.matrix(Vanderbiltxy)
+remove(Vanderbiltxcoord)
+remove(Vanderbiltycoord)
+remove(Vanderbiltxy)
+```
+
+``` {r, echo=FALSE, include=FALSE, cache=TRUE}
+
+DavidsonCountyTracts <- get_acs(state = "TN", county = "Davidson", geography = "tract", 
+                          variables = "B00001_001", geometry = TRUE)
+DavidsonCountyTracts <- mutate(DavidsonCountyTracts, censusTractNum = substr(DavidsonCountyTracts$GEOID,4,11))
+
+```
+
+```{r loading crime data, echo=FALSE, include=FALSE, cache=TRUE}
+#Clean crime data to include only those crimes since start of 2017 and only those crimes that actually occurred in Nashville.
+load(file  = "~/MUSA/Fall/Applied_Spatial_Analysis/midterm_competition/midtermData_forStudents/midtermData_forStudents/CrimeDataUse.RData")
+
+```
+
+
+```{r cleaning crime data, echo=FALSE, include=FALSE,cache=TRUE}
+
+#Create XY matrix to calculate nearest neighbors
+CrimeXYMatrix <-
+  crimeDataUse %>%
+  dplyr::select(longitude,latitude) %>%
+  mutate(longitude = as.numeric(longitude)) %>%
+  mutate(latitude = as.numeric(latitude)) %>%
+  as.matrix()
+
+CrimeXYMatrixDrug <-
+  crimeDataUse %>%
+  filter(offense_description == "POSSESSION OF A CONTROLLED SUBSTANCE" | offense_description == "POSSESSION OF A CONTROLLED SUB FOR RESALE" | offense_description == "MARIJUANA (FREE TEXT)" | offense_description == "MARIJUANA - SELL" | offense_description == "MARIJUANA - POSSESS" | offense_description == "DRUG PARAPHERNALIA- UNLAWFUL USE" | offense_description == "DRUG FREE SCH.ZONE-CONT.SUB.-SCH. IV") %>%
+  dplyr::select(longitude,latitude) %>%
+  mutate(longitude = as.numeric(longitude)) %>%
+  mutate(latitude = as.numeric(latitude)) %>%
+  as.matrix()
+
+CrimeXYMatrixAssault <-
+  crimeDataUse %>%
+  filter(offense_description == "AGGRAV ASSLT - FAMILY-GUN" | offense_description == "AGGRAV ASSLT - FAMILY-WEAPON" | offense_description == "AGGRAV ASSLT - NONFAMILY-GUN" | offense_description == "AGGRAV ASSLT - NONFAMILY-WEAPON" | offense_description == "Assault, Agg - Deadly Weapon- Int/Kn- Acting in Concert" | offense_description == "Assault, Agg - Serious Bodily Injury- Int/Kn- Acting in Concert" | offense_description == "Assault, Agg - Strangulation- Int/Kn- Acting in Concert" | offense_description == "Assault, Aggravated - Deadly Weapon - Int/Kn" | offense_description == "Assault, Aggravated - Deadly Weapon - Reckless" | offense_description == "Assault, Aggravated - Serious Bodily Injury - Reckless" | offense_description == "Assault, Aggravated - Strangulation - Int/Kn") %>%
+  dplyr::select(longitude,latitude) %>%
+  mutate(longitude = as.numeric(longitude)) %>%
+  mutate(latitude = as.numeric(latitude)) %>%
+  as.matrix()
+  
+CrimeXYMatrixRobbery <-
+  crimeDataUse %>%
+  filter(offense_description == "ROBBERY" | offense_description == "ROBBERY- AGG.- SERIOUS BODILY INJURY" | offense_description == "ROBBERY- CARJACKING" | offense_description == "ROBBERY- ESP. AGG." | offense_description == "Robbery - Acting in Concert" | offense_description == "ROBBERY, AGGRAVATED, HANDGUN" | offense_description == "ROBBERY, AGGRAVATED, KNIFE" | offense_description == "ROBBERY, AGGRAVATED, LONG GUN" | offense_description == "ROBBERY, AGGRAVATED, OTHER") %>%
+  dplyr::select(longitude,latitude) %>%
+  mutate(longitude = as.numeric(longitude)) %>%
+  mutate(latitude = as.numeric(latitude)) %>%
+  as.matrix()
+
+# convert crimeData to a sf object with 'geometry' column
+crimeDataUse <- st_as_sf(crimeDataUse, coords = c("longitude", "latitude"), 
+                        crs = 4326)
+
+#calculate nearest neighbors
+Crime_to_sales_NN = get.knnx(CrimeXYMatrix,HomeSalesXYMatrix,k=3)
+Crime_to_sales_NN_Drug = get.knnx(CrimeXYMatrixDrug,HomeSalesXYMatrix,k=3)
+Crime_to_sales_NN_Assault = get.knnx(CrimeXYMatrixAssault,HomeSalesXYMatrix,k=3)
+Crime_to_sales_NN_Robbery = get.knnx(CrimeXYMatrixRobbery,HomeSalesXYMatrix,k=3)
+```
+
+``` {r import and clean police station data, echo=FALSE, include=FALSE, cache=TRUE}
+PoliceStations <- read.socrata("https://data.nashville.gov/resource/sr5q-zarg.json")
+
+PoliceStationXYMatrix <-
+  PoliceStations %>%
+  dplyr::select(mapped_location.longitude,mapped_location.latitude) %>%
+  mutate(mapped_location.longitude = as.numeric(mapped_location.longitude)) %>%
+  mutate(mapped_location.latitude = as.numeric(mapped_location.latitude)) %>%
+  as.matrix()
+PoliceStation_to_sales_NN = get.knnx(PoliceStationXYMatrix,HomeSalesXYMatrix,k=1)
+```
+
+``` {r loading prop viol, echo=FALSE, include=FALSE, cache=TRUE}
+
+
+load(file  = "~/MUSA/Fall/Applied_Spatial_Analysis/midterm_competition/midtermData_forStudents/midtermData_forStudents/PropViolDataUse.RData")
+
+```
+
+``` {r cleaning prop viol, echo=FALSE, include=FALSE, cache=TRUE}
+
+#Create XY matrix to calculate nearest neighbors
+PropViolXYMatrix <-
+  PropViolDataUse %>%
+  dplyr::select(longitude,latitude) %>%
+  mutate(longitude = as.numeric(longitude)) %>%
+  mutate(latitude = as.numeric(latitude)) %>%
+  as.matrix()
+
+
+#calculate nearest neighbors
+PropViol_to_sales_NN = get.knnx(PropViolXYMatrix,HomeSalesXYMatrix,k=3)
+```
+
+``` {r nearest other home sales neighbors, echo=FALSE, include=FALSE, cache=TRUE}
+#############################Adding all our other data to our original train_and_test_student data
+#adding in average distance to nearest other sales (of different types)
+Sales_to_sales_NN = get.knnx(HomeSalesXYMatrix,HomeSalesXYMatrix,k=5)
+#Sales_to_VacSales_NN = get.knnx(HomeSalesXYMatrixVacant,HomeSalesXYMatrix,k=16)
+Sales_to_SFSales_NN = get.knnx(HomeSalesXYMatrixSingleFamily,HomeSalesXYMatrix,k=5)
+Sales_to_CondoSales_NN = get.knnx(HomeSalesXYMatrixResidentialCondo,HomeSalesXYMatrix,k=5)
+
+Sales_to_salesWithSqFt_NN = get.knnx(HomeSalesXYMatrixWithSqFt,HomeSalesXYMatrix,k=5)
+#Sales_to_VacSales_NN = get.knnx(HomeSalesXYMatrixVacant,HomeSalesXYMatrix,k=16)
+Sales_to_SFSalesWithSqFt_NN = get.knnx(HomeSalesXYMatrixSingleFamilyWithSqFt,HomeSalesXYMatrix,k=5)
+Sales_to_CondoSalesWithSqFt_NN = get.knnx(HomeSalesXYMatrixResidentialCondoWithSqFt,HomeSalesXYMatrix,k=5)
+
+#adding distance to other sales
+train_and_test_student <-
+  as.data.frame(Sales_to_sales_NN$nn.dist) %>%
+  rownames_to_column(var = "SaleUniq") %>%
+  dplyr::select(-V1) %>%
+  gather(OtherSales, Sale_Dist, V2:V5) %>%
+  arrange(as.numeric(SaleUniq)) %>%
+  group_by(SaleUniq) %>%
+  summarize(d_OthSale = mean(Sale_Dist)) %>%
+  arrange(as.numeric(SaleUniq)) %>% 
+  dplyr::select(-SaleUniq) %>%
+  bind_cols(train_and_test_student)
+#adding average sales prices of nearest neighbors of various types
+
+train_and_test_student <-
+  as.data.frame(Sales_to_salesWithSqFt_NN$nn.index) %>%
+  rownames_to_column(var = "SaleUniq") %>%
+  gather(OtherSales, Sale_Ind, V2:V5) %>%
+  arrange(as.numeric(SaleUniq)) %>%
+  group_by(SaleUniq) %>%
+  left_join(OnlySalesPerSFAndKeys, by = c("Sale_Ind" = "newIDnum")) %>%
+  summarize(avgNearSalePricePerSF = mean(pricePerSF)) %>%
+  arrange(as.numeric(SaleUniq)) %>% 
+  dplyr::select(-SaleUniq) %>%
+  bind_cols(train_and_test_student)
+train_and_test_student <-
+  as.data.frame(Sales_to_sales_NN$nn.index) %>%
+  rownames_to_column(var = "SaleUniq") %>%
+  gather(OtherSales, Sale_Ind, V2:V5) %>%
+  arrange(as.numeric(SaleUniq)) %>%
+  group_by(SaleUniq) %>%
+  left_join(OnlySalesAndKeys, by = c("Sale_Ind" = "newIDnum")) %>%
+  summarize(avgNearSalePrice = mean(SalePrice)) %>%
+  arrange(as.numeric(SaleUniq)) %>% 
+  dplyr::select(-SaleUniq) %>%
+  bind_cols(train_and_test_student)
+
+#Average near sales and sales per SF by type
+train_and_test_student <-
+  as.data.frame(Sales_to_SFSales_NN$nn.index) %>%
+  rownames_to_column(var = "SaleUniq") %>%
+  gather(OtherSales, Sale_Ind, V2:V5) %>%
+  arrange(as.numeric(SaleUniq)) %>%
+  group_by(SaleUniq) %>%
+  left_join(OnlySalesSingleFamilyAndKeys, by = c("Sale_Ind" = "newIDnum")) %>%
+  summarize(avgNearSFSalePrice = mean(SalePrice)) %>%
+  arrange(as.numeric(SaleUniq)) %>% 
+  dplyr::select(-SaleUniq) %>%
+  bind_cols(train_and_test_student)
+train_and_test_student <-
+  as.data.frame(Sales_to_CondoSales_NN$nn.index) %>%
+  rownames_to_column(var = "SaleUniq") %>%
+  gather(OtherSales, Sale_Ind, V2:V5) %>%
+  arrange(as.numeric(SaleUniq)) %>%
+  group_by(SaleUniq) %>%
+  left_join(OnlySalesCondoAndKeys, by = c("Sale_Ind" = "newIDnum")) %>%
+  summarize(avgNearCondoSalePrice = mean(SalePrice)) %>%
+  arrange(as.numeric(SaleUniq)) %>% 
+  dplyr::select(-SaleUniq) %>%
+  bind_cols(train_and_test_student)
+train_and_test_student <-
+  train_and_test_student %>%
+  #mutate(avgNearVacSalePrice = if_else(LandUseFullDescription == "VACANT RESIDENTIAL LAND",avgNearVacSalePrice,NULL)) %>%
+  #mutate(avgNearSFSalePrice = if_else(LandUseFullDescription == "SINGLE FAMILY",avgNearSFSalePrice,NULL)) %>%
+  #mutate(avgNearCondoSalePrice = if_else(LandUseFullDescription == "RESIDENTIAL CONDO",avgNearCondoSalePrice,NULL)) %>%
+  mutate(avgNearSameTypeSalePrice = if_else(LandUseFullDescription == "SINGLE FAMILY" | LandUseFullDescription == "DUPLEX" | LandUseFullDescription == "ZERO LOT LINE" | LandUseFullDescription == "MOBILE HOME",avgNearSFSalePrice,if_else(LandUseFullDescription == "RESIDENTIAL CONDO" | LandUseFullDescription == "RESIDENTIAL COMBO/MISC",avgNearCondoSalePrice,NULL)))
+
+train_and_test_student <-
+  as.data.frame(Sales_to_SFSalesWithSqFt_NN$nn.index) %>%
+  rownames_to_column(var = "SaleUniq") %>%
+  gather(OtherSales, Sale_Ind, V2:V5) %>%
+  arrange(as.numeric(SaleUniq)) %>%
+  group_by(SaleUniq) %>%
+  left_join(OnlySalesPerSFSingleFamilyAndKeys, by = c("Sale_Ind" = "newIDnum")) %>%
+  summarize(avgNearSFSalePricePerSF = mean(pricePerSF)) %>%
+  arrange(as.numeric(SaleUniq)) %>% 
+  dplyr::select(-SaleUniq) %>%
+  bind_cols(train_and_test_student)
+train_and_test_student <-
+  as.data.frame(Sales_to_CondoSalesWithSqFt_NN$nn.index) %>%
+  rownames_to_column(var = "SaleUniq") %>%
+  gather(OtherSales, Sale_Ind, V2:V5) %>%
+  arrange(as.numeric(SaleUniq)) %>%
+  group_by(SaleUniq) %>%
+  left_join(OnlySalesPerSFCondoAndKeys, by = c("Sale_Ind" = "newIDnum")) %>%
+  summarize(avgNearCondoSalePricePerSF = mean(pricePerSF)) %>%
+  arrange(as.numeric(SaleUniq)) %>% 
+  dplyr::select(-SaleUniq) %>%
+  bind_cols(train_and_test_student)
+train_and_test_student <-
+  train_and_test_student %>%
+  #mutate(avgNearVacSalePrice = if_else(LandUseFullDescription == "VACANT RESIDENTIAL LAND",avgNearVacSalePrice,NULL)) %>%
+  #mutate(avgNearSFSalePricePerSF = if_else(LandUseFullDescription == "SINGLE FAMILY",avgNearSFSalePricePerSF,NULL)) %>%
+  #mutate(avgNearCondoSalePricePerSF = if_else(LandUseFullDescription == "RESIDENTIAL CONDO",avgNearCondoSalePricePerSF,NULL)) %>%
+  mutate(avgNearSameTypeSalePricePerSF = if_else(LandUseFullDescription == "SINGLE FAMILY" | LandUseFullDescription == "DUPLEX" | LandUseFullDescription == "ZERO LOT LINE" | LandUseFullDescription == "MOBILE HOME",avgNearSFSalePricePerSF,if_else(LandUseFullDescription == "RESIDENTIAL CONDO" | LandUseFullDescription == "RESIDENTIAL COMBO/MISC",avgNearCondoSalePricePerSF,NULL)))
+
+########________________________________________________________________________________________________________
+#adding in average distance to nearest other sales (of different types)
+Sales_to_sales_NN15 = get.knnx(HomeSalesXYMatrix,HomeSalesXYMatrix,k=15)
+#Sales_to_VacSales_NN15 = get.knnx(HomeSalesXYMatrixVacant,HomeSalesXYMatrix,k=16)
+Sales_to_SFSales_NN15 = get.knnx(HomeSalesXYMatrixSingleFamily,HomeSalesXYMatrix,k=15)
+Sales_to_CondoSales_NN15 = get.knnx(HomeSalesXYMatrixResidentialCondo,HomeSalesXYMatrix,k=15)
+
+Sales_to_salesWithSqFt_NN15 = get.knnx(HomeSalesXYMatrixWithSqFt,HomeSalesXYMatrix,k=15)
+#Sales_to_VacSales_NN15 = get.knnx(HomeSalesXYMatrixVacant,HomeSalesXYMatrix,k=16)
+Sales_to_SFSalesWithSqFt_NN15 = get.knnx(HomeSalesXYMatrixSingleFamilyWithSqFt,HomeSalesXYMatrix,k=15)
+Sales_to_CondoSalesWithSqFt_NN15 = get.knnx(HomeSalesXYMatrixResidentialCondoWithSqFt,HomeSalesXYMatrix,k=15)
+
+train_and_test_student <-
+  as.data.frame(Sales_to_salesWithSqFt_NN15$nn.index) %>%
+  rownames_to_column(var = "SaleUniq") %>%
+  gather(OtherSales, Sale_Ind, V2:V15) %>%
+  arrange(as.numeric(SaleUniq)) %>%
+  group_by(SaleUniq) %>%
+  left_join(OnlySalesPerSFAndKeys, by = c("Sale_Ind" = "newIDnum")) %>%
+  summarize(avgNearSalePricePerSF15 = mean(pricePerSF)) %>%
+  arrange(as.numeric(SaleUniq)) %>% 
+  dplyr::select(-SaleUniq) %>%
+  bind_cols(train_and_test_student)
+train_and_test_student <-
+  as.data.frame(Sales_to_sales_NN15$nn.index) %>%
+  rownames_to_column(var = "SaleUniq") %>%
+  gather(OtherSales, Sale_Ind, V2:V15) %>%
+  arrange(as.numeric(SaleUniq)) %>%
+  group_by(SaleUniq) %>%
+  left_join(OnlySalesAndKeys, by = c("Sale_Ind" = "newIDnum")) %>%
+  summarize(avgNearSalePrice15 = mean(SalePrice)) %>%
+  arrange(as.numeric(SaleUniq)) %>% 
+  dplyr::select(-SaleUniq) %>%
+  bind_cols(train_and_test_student)
+
+#Average near sales and sales per SF by type
+train_and_test_student <-
+  as.data.frame(Sales_to_SFSales_NN15$nn.index) %>%
+  rownames_to_column(var = "SaleUniq") %>%
+  gather(OtherSales, Sale_Ind, V2:V15) %>%
+  arrange(as.numeric(SaleUniq)) %>%
+  group_by(SaleUniq) %>%
+  left_join(OnlySalesSingleFamilyAndKeys, by = c("Sale_Ind" = "newIDnum")) %>%
+  summarize(avgNearSFSalePrice15 = mean(SalePrice)) %>%
+  arrange(as.numeric(SaleUniq)) %>% 
+  dplyr::select(-SaleUniq) %>%
+  bind_cols(train_and_test_student)
+train_and_test_student <-
+  as.data.frame(Sales_to_CondoSales_NN15$nn.index) %>%
+  rownames_to_column(var = "SaleUniq") %>%
+  gather(OtherSales, Sale_Ind, V2:V15) %>%
+  arrange(as.numeric(SaleUniq)) %>%
+  group_by(SaleUniq) %>%
+  left_join(OnlySalesCondoAndKeys, by = c("Sale_Ind" = "newIDnum")) %>%
+  summarize(avgNearCondoSalePrice15 = mean(SalePrice)) %>%
+  arrange(as.numeric(SaleUniq)) %>% 
+  dplyr::select(-SaleUniq) %>%
+  bind_cols(train_and_test_student)
+train_and_test_student <-
+  train_and_test_student %>%
+  #mutate(avgNearVacSalePrice = if_else(LandUseFullDescription == "VACANT RESIDENTIAL LAND",avgNearVacSalePrice,NULL)) %>%
+  #mutate(avgNearSFSalePrice = if_else(LandUseFullDescription == "SINGLE FAMILY",avgNearSFSalePrice,NULL)) %>%
+  #mutate(avgNearCondoSalePrice = if_else(LandUseFullDescription == "RESIDENTIAL CONDO",avgNearCondoSalePrice,NULL)) %>%
+  mutate(avgNearSameTypeSalePrice15 = if_else(LandUseFullDescription == "SINGLE FAMILY" | LandUseFullDescription == "DUPLEX" | LandUseFullDescription == "ZERO LOT LINE" | LandUseFullDescription == "MOBILE HOME",avgNearSFSalePrice15,if_else(LandUseFullDescription == "RESIDENTIAL CONDO" | LandUseFullDescription == "RESIDENTIAL COMBO/MISC",avgNearCondoSalePrice15,NULL)))
+
+train_and_test_student <-
+  as.data.frame(Sales_to_SFSalesWithSqFt_NN15$nn.index) %>%
+  rownames_to_column(var = "SaleUniq") %>%
+  gather(OtherSales, Sale_Ind, V2:V15) %>%
+  arrange(as.numeric(SaleUniq)) %>%
+  group_by(SaleUniq) %>%
+  left_join(OnlySalesPerSFSingleFamilyAndKeys, by = c("Sale_Ind" = "newIDnum")) %>%
+  summarize(avgNearSFSalePricePerSF15 = mean(pricePerSF)) %>%
+  arrange(as.numeric(SaleUniq)) %>% 
+  dplyr::select(-SaleUniq) %>%
+  bind_cols(train_and_test_student)
+train_and_test_student <-
+  as.data.frame(Sales_to_CondoSalesWithSqFt_NN15$nn.index) %>%
+  rownames_to_column(var = "SaleUniq") %>%
+  gather(OtherSales, Sale_Ind, V2:V15) %>%
+  arrange(as.numeric(SaleUniq)) %>%
+  group_by(SaleUniq) %>%
+  left_join(OnlySalesPerSFCondoAndKeys, by = c("Sale_Ind" = "newIDnum")) %>%
+  summarize(avgNearCondoSalePricePerSF15 = mean(pricePerSF)) %>%
+  arrange(as.numeric(SaleUniq)) %>% 
+  dplyr::select(-SaleUniq) %>%
+  bind_cols(train_and_test_student)
+train_and_test_student <-
+  train_and_test_student %>%
+  #mutate(avgNearVacSalePrice = if_else(LandUseFullDescription == "VACANT RESIDENTIAL LAND",avgNearVacSalePrice,NULL)) %>%
+  #mutate(avgNearSFSalePricePerSF = if_else(LandUseFullDescription == "SINGLE FAMILY",avgNearSFSalePricePerSF,NULL)) %>%
+  #mutate(avgNearCondoSalePricePerSF = if_else(LandUseFullDescription == "RESIDENTIAL CONDO",avgNearCondoSalePricePerSF,NULL)) %>%
+  mutate(avgNearSameTypeSalePricePerSF15 = if_else(LandUseFullDescription == "SINGLE FAMILY" | LandUseFullDescription == "DUPLEX" | LandUseFullDescription == "ZERO LOT LINE" | LandUseFullDescription == "MOBILE HOME",avgNearSFSalePricePerSF15,if_else(LandUseFullDescription == "RESIDENTIAL CONDO" | LandUseFullDescription == "RESIDENTIAL COMBO/MISC",avgNearCondoSalePricePerSF15,NULL)))
+########________________________________________________________________________________________________________
+```
+
+``` {r nearest crime neighbors, echo=FALSE, include=FALSE, cache=TRUE}
+
+#adding in average distance to nearest crime neighbors
+train_and_test_student <-
+  as.data.frame(Crime_to_sales_NN$nn.dist) %>%
+  rownames_to_column(var = "SaleUniq") %>%
+  gather(Crime, Crime_Dist, V1:V3) %>%
+  arrange(as.numeric(SaleUniq)) %>%
+  group_by(SaleUniq) %>%
+  summarize(d_crime = mean(Crime_Dist)) %>%
+  arrange(as.numeric(SaleUniq)) %>% 
+  dplyr::select(-SaleUniq) %>%
+  bind_cols(train_and_test_student)
+train_and_test_student <-
+  as.data.frame(Crime_to_sales_NN_Drug$nn.dist) %>%
+  rownames_to_column(var = "SaleUniq") %>%
+  gather(Crime, Crime_Dist, V1:V3) %>%
+  arrange(as.numeric(SaleUniq)) %>%
+  group_by(SaleUniq) %>%
+  summarize(d_crime_drug = mean(Crime_Dist)) %>%
+  arrange(as.numeric(SaleUniq)) %>% 
+  dplyr::select(-SaleUniq) %>%
+  bind_cols(train_and_test_student)
+train_and_test_student <-
+  as.data.frame(Crime_to_sales_NN_Assault$nn.dist) %>%
+  rownames_to_column(var = "SaleUniq") %>%
+  gather(Crime, Crime_Dist, V1:V3) %>%
+  arrange(as.numeric(SaleUniq)) %>%
+  group_by(SaleUniq) %>%
+  summarize(d_crime_assault = mean(Crime_Dist)) %>%
+  arrange(as.numeric(SaleUniq)) %>% 
+  dplyr::select(-SaleUniq) %>%
+  bind_cols(train_and_test_student)
+train_and_test_student <-
+  as.data.frame(Crime_to_sales_NN_Robbery$nn.dist) %>%
+  rownames_to_column(var = "SaleUniq") %>%
+  gather(Crime, Crime_Dist, V1:V3) %>%
+  arrange(as.numeric(SaleUniq)) %>%
+  group_by(SaleUniq) %>%
+  summarize(d_crime_robbery = mean(Crime_Dist)) %>%
+  arrange(as.numeric(SaleUniq)) %>% 
+  dplyr::select(-SaleUniq) %>%
+  bind_cols(train_and_test_student)
+```
+
+``` {r nearest propviol, police, CBD, vanderbilt neighbors and distances, echo=FALSE, include=FALSE, cache=TRUE}
+
+#adding in average distance to nearest PropViol neighbors
+train_and_test_student <-
+  as.data.frame(PropViol_to_sales_NN$nn.dist) %>%
+  rownames_to_column(var = "SaleUniq") %>%
+  gather(PropViol, PropViol_Dist, V1:V3) %>%
+  arrange(as.numeric(SaleUniq)) %>%
+  group_by(SaleUniq) %>%
+  summarize(d_PropViol = mean(PropViol_Dist)) %>%
+  arrange(as.numeric(SaleUniq)) %>% 
+  dplyr::select(-SaleUniq) %>%
+  bind_cols(train_and_test_student)
+
+#adding in average distance to nearest Police Precinct
+train_and_test_student <-
+  as.data.frame(PoliceStation_to_sales_NN$nn.dist) %>%
+  rownames_to_column(var = "SaleUniq") %>%
+  gather(PoliceStation, Police_Dist, V1:V1) %>%
+  arrange(as.numeric(SaleUniq)) %>%
+  group_by(SaleUniq) %>%
+  summarize(d_Police = mean(Police_Dist)) %>%
+  arrange(as.numeric(SaleUniq)) %>% 
+  dplyr::select(-SaleUniq) %>%
+  bind_cols(train_and_test_student)
+
+#Distance to CBD and Vanderbilt
+train_and_test_student <- mutate(train_and_test_student,distToCBD = distHaversine(HomeSalesXYMatrix, CBDPoint))
+train_and_test_student <- mutate(train_and_test_student,distToVanderbilt = distHaversine(HomeSalesXYMatrix, VanderbiltPoint))
+
+```
+
+``` {r trial run successful ggplot and geom_point example, echo=FALSE, include=FALSE, cache=TRUE}
+ggplot() + geom_point(data=train_and_test_student, aes(x=WGS1984X, y=WGS1984Y, colour=factor(ntile(distToVanderbilt,5))),  size = .1) 
+
+```
+
+``` {r yearbuilt and seasonality, echo=FALSE, include=FALSE, cache=TRUE}
+
+train_and_test_student <- train_and_test_student %>%
+  mutate(noBuildYear = ifelse(yearbuilt_building < 1700, 1, 0)) %>%
+  mutate(earlierBuilt = ifelse(yearbuilt_building < 1930 & yearbuilt_building != 0, 1, 0)) %>%
+  mutate(thirtiesBuilt = ifelse(yearbuilt_building > 1930 & yearbuilt_building < 1940, 1, 0)) %>%
+  mutate(fortiesBuilt = ifelse(yearbuilt_building > 1940 & yearbuilt_building < 1950, 1, 0)) %>%
+  mutate(fiftiesBuilt = ifelse(yearbuilt_building > 1950 & yearbuilt_building < 1960, 1, 0)) %>%
+  mutate(sixtiesBuilt = ifelse(yearbuilt_building > 1960 & yearbuilt_building < 1970, 1, 0)) %>%
+  mutate(seventiesBuilt = ifelse(yearbuilt_building > 1970 & yearbuilt_building < 1980, 1, 0)) %>%
+  mutate(eightiesBuilt = ifelse(yearbuilt_building > 1980 & yearbuilt_building < 1990, 1, 0)) %>%
+  mutate(ninetiesBuilt = ifelse(yearbuilt_building > 1990 & yearbuilt_building < 2000, 1, 0)) %>%
+  mutate(twoThousandsBuilt = ifelse(yearbuilt_building > 2000 & yearbuilt_building < 2010, 1, 0))
+
+train_and_test_student <- train_and_test_student %>%
+  mutate(January = ifelse(substr(train_and_test_student$OwnerInstrument,8,9) == "01", 1, 0)) %>%
+  mutate(February = ifelse(substr(train_and_test_student$OwnerInstrument,8,9) == "02", 1, 0)) %>%
+  mutate(March = ifelse(substr(train_and_test_student$OwnerInstrument,8,9) == "03", 1, 0)) %>%
+  mutate(April = ifelse(substr(train_and_test_student$OwnerInstrument,8,9) == "04", 1, 0)) %>%
+  mutate(May = ifelse(substr(train_and_test_student$OwnerInstrument,8,9) == "05", 1, 0)) %>%
+  mutate(June = ifelse(substr(train_and_test_student$OwnerInstrument,8,9) == "06", 1, 0)) %>%
+  mutate(July = ifelse(substr(train_and_test_student$OwnerInstrument,8,9) == "07", 1, 0)) %>%
+  mutate(August = ifelse(substr(train_and_test_student$OwnerInstrument,8,9) == "08", 1, 0)) %>%
+  mutate(September = ifelse(substr(train_and_test_student$OwnerInstrument,8,9) == "09", 1, 0)) %>%
+  mutate(October = ifelse(substr(train_and_test_student$OwnerInstrument,8,9) == "10", 1, 0)) %>%
+  mutate(November = ifelse(substr(train_and_test_student$OwnerInstrument,8,9) == "11", 1, 0)) %>%
+  mutate(December = ifelse(substr(train_and_test_student$OwnerInstrument,8,9) == "12", 1, 0)) 
+
+```
+
+``` {r regFormula, echo=FALSE, include=FALSE, cache=TRUE}
+regFormula <- SalePrice ~ Acrage + sf_finished_less_ifla +
+              baths + avgHtfl_building + sf_bsmt + sf_bsmt_fin + ac_sfyi + effyearbuilt_building + yearbuilt_building +
+              d_crime + d_crime_drug + d_crime_assault + d_crime_robbery + d_OthSale + d_PropViol + distToCBD + 
+              distToVanderbilt + avgNearSalePrice + as.factor(LocationZip) + avgNearSalePricePerSF + 
+              noBuildYear + earlierBuilt + d_Police + avgNearSameTypeSalePrice + avgNearSameTypeSalePricePerSF + avgNearSameTypeSalePrice15 + avgNearSameTypeSalePricePerSF15 + 
+              thirtiesBuilt + fortiesBuilt + fiftiesBuilt + sixtiesBuilt + seventiesBuilt + eightiesBuilt +
+              ninetiesBuilt + twoThousandsBuilt + roomsunits_building + bedroomsunits_building + units_building  + #as.factor(LandUseFullDescription) + as.factor(Frame) + 
+              February + March + April + May + June + July + August + September + October + November + December
+  
+```
+
+``` {r developing lm model and cross-validating it, echo=FALSE, include=FALSE, cache=TRUE}
+
+#remove unknown data, then partition data into training and test sets
+onlyKnownData <- subset(train_and_test_student,train_and_test_student$test == 0)
+onlyUnknownData <- subset(train_and_test_student,train_and_test_student$test == 1)
+inTrain <- createDataPartition(
+  y = onlyKnownData$SalePrice, 
+  p = .75, list = FALSE)
+training <- onlyKnownData[ inTrain,] #the new training set
+test <- onlyKnownData[-inTrain,]  #the new test set
+
+#Derive new model from training set
+regOntrain <- lm(regFormula, data = training, na.action = na.omit) #, na.action = na.omit
+summary(regOntrain)
+
+#regOnTrainPredNew <- missingLevelsToNA(regOntrain,test)  #see function defined above
+
+#Tries out this new model on the test set and all data
+regOnTrainPred <- predict(regOntrain, test) 
+regOnAllPred <- predict(regOntrain, train_and_test_student) 
+
+
+#calculating the mean absolute error
+regOnTrainValues <- 
+  data.frame(test$kenID,observedSalePrice = test$SalePrice,
+             predictedSalePrice = regOnTrainPred)
+
+regOnTrainValues <-
+  regOnTrainValues %>%
+  mutate(error = predictedSalePrice - observedSalePrice) %>%
+  mutate(absError = abs(predictedSalePrice - observedSalePrice)) %>%
+  mutate(percentAbsError = abs(predictedSalePrice - observedSalePrice) / observedSalePrice) 
+
+head(regOnTrainValues)
+
+mean(regOnTrainValues$absError)
+mean(regOnTrainValues$percentAbsError)
+
+###Cross-validation
+fitControl <- trainControl(method = "cv", number = 100)
+
+set.seed(825)
+
+lmFit <- train(regFormula, data = onlyKnownData, 
+               method = "lm", 
+               trControl = fitControl, na.action = na.omit)  #, na.action = na.omit
+lmFit
+
+#interpreting this outfit (Look at R-squared and MAE -- these are the average figures for these across hundreds of test sets)
+
+lmFit$resample
+sd(lmFit$resample[,3])
+#histogram of holdout MAE
+ggplot(as.data.frame(lmFit$resample), aes(MAE)) + 
+  geom_histogram(bins=20) +
+  labs(x="Mean Absolute Error",
+       y="Count")
+
+
+```
+# Introduction
+
+This project aims to predict prices of home sales based on observable characteristics of the home. Improving our ability to predict home prices would allow a variety of end users, from private homebuyers and homesellers to housing affordability advocates, to make better decisions and more efficiently allocate resources.  Obviously, predicting prices is difficult because sale price is affected by many intangible and hard to observe characteristics.  Additionally there is a tradeoff between generalizability and accuracy; a model targeted towards a broader range of areas is more widely applicable, yet likely less incisive, than one narrowly targeted toward a particular market.  Our modeling strategy only aims to predict in one market, Nashville, and centers around attributes of the home, attributes of the neighborhood, and comparable sales nearby.  Ultimately, our model identifies several useful predictors, including some specific to Nashville; however, our model's predictions are typically off by roughly 100 thousand dollars, and we see room for further improvements.
+
+# Data
+
+We utilized several different sources of data.  First and most important are listings of extant home sales and the characteristics of the homes, sourced from provided data.  These included the square footage, acrage, type of home, season of sale, year built, floor height and location.  Second were spatial characteristics, such as proximity to amenities and disamenities.  These included 1) distance to different types of crimes, such as robberies, assaults, and drug crimes, 2) distance to police stations, 3) distance to property code violations, and 4) distance to major employment centers such as the central business district (CBD) and Vanderbilt University.  This data was sourced from Nashville's OpenData portal or constructed manually.  Finally, we used the spatial characteristics of the original home sale dataset to create predictors measuring spatial autocorrelation, i.e. proximity to other sales of the same housing stock type and their sale prices and prices per square foot.  This last set of predictors essentially mimics the real estate valuation technique of comparable sale comparison, which is the standard in the industry.
+
+##Summary Statistics and Correlation Matrix
+Below are the Summary Statistics and a Correlation Matrix of our most significant and/or interesting variables.  While our model contains many more variables than those listed here, we felt that the variables selected below were the most interesting, significant, and worth focusing on.  This selection contains a sampling of important variables related to the internal characteristics, locational amenities, and spatial structure of the sales.
+
+``` {r Summary Stats, echo=FALSE, include=TRUE, cache=TRUE}
+train_and_test_student_summary_stats_selected <-
+  train_and_test_student %>%
+  select_if(is.numeric) %>%
+  dplyr::select(Acrage,sf_finished_less_ifla,sf_bsmt_fin,distToCBD,distToVanderbilt,d_Police,d_PropViol,d_crime,avgNearSameTypeSalePrice,avgNearSameTypeSalePrice15,avgNearSameTypeSalePricePerSF,avgNearSameTypeSalePricePerSF15,)
+
+#  dplyr::select(Acrage,sf_finished_less_ifla,sf_bsmt_fin,distToCBD,distToVanderbilt,d_Police,d_PropViol,d_crime,avgNearSameTypeSalePrice,avgNearSameTypeSalePrice15,avgNearSameTypeSalePricePerSF,avgNearSameTypeSalePricePerSF15,)
+
+kable(t(summary(train_and_test_student_summary_stats_selected))) %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed")) %>%
+  group_rows("Internal Characteristics", 1, 3) %>%
+  group_rows("Amenities/Public Services", 4, 8) %>%
+  group_rows("Spatial Structure", 9, 12)
+  
+```
+
+``` {r correlation Matrix, echo=FALSE, include=TRUE, cache=TRUE}
+corr_matrix_train_and_test_data <- cor(train_and_test_student_summary_stats_selected, method = "pearson", use = "complete.obs")
+kable(corr_matrix_train_and_test_data, digits = 2, col.names = c("Acrage","SF","BtSF","D_CBD","D_Vbilt","D_Pol","D_Viol","D_Crim","ANNP5","ANNP15","ANNPSF5","ANNPSF15")) %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed")) %>%
+  row_spec(0, angle = -20, hline_after = TRUE)
+  
+
+```
+
+##Sale Prices
+Below are two maps of sales in the Nashville area, colored by sale price and by count of sales.  It is evident that while sales are concentrated in the southeastern suburban boundary, in a couple pockets of North and East Nashville, and to a lesser extent in near South Nashville, the highest sale prices are located in the far south Nashville neighborhoods of Green Hills and Belle Meade.  Sales are shown aggregated to tract level for ease of interpretation.
+
+``` {r Map of Mean and Count Sales Prices by Census Tract, echo=FALSE, include=TRUE, cache=TRUE}
+train_and_test_student_mean_sale_price <-
+  train_and_test_student %>%
+  group_by(CensusBlock) %>%
+  mutate(ac_sfyi = as.numeric(ac_sfyi)) %>%
+  summarize(meansalePrice = mean(SalePrice, na.rm=TRUE),
+            meanDistancePropViol = mean(d_PropViol, na.rm=TRUE),
+            meansalePrice5NN = mean(avgNearSameTypeSalePrice, na.rm=TRUE),
+            meansalePrice15NN = mean(avgNearSameTypeSalePrice15, na.rm=TRUE),
+            meansalePrice5NNperSqFt = mean(avgNearSameTypeSalePricePerSF15, na.rm=TRUE),
+            meansalePrice15NNperSqFt = mean(avgNearSameTypeSalePricePerSF, na.rm=TRUE),
+            meanearlierBuilt = mean(earlierBuilt, na.rm=TRUE),
+            mean30sBuilt = mean(thirtiesBuilt, na.rm=TRUE),
+            mean40sBuilt = mean(fortiesBuilt, na.rm=TRUE),
+            mean50sBuilt = mean(fiftiesBuilt, na.rm=TRUE),
+            mean60sBuilt = mean(sixtiesBuilt, na.rm=TRUE),
+            mean70sBuilt = mean(seventiesBuilt, na.rm=TRUE),
+            mean80sBuilt = mean(eightiesBuilt, na.rm=TRUE),
+            mean90sBuilt = mean(ninetiesBuilt, na.rm=TRUE),
+            mean00sBuilt = mean(twoThousandsBuilt, na.rm=TRUE),
+            meanac_sfyi = mean(ac_sfyi, na.rm = TRUE),
+            meand_OthSale = mean(d_OthSale, na.rm = TRUE),
+            meand_PropViol = mean(d_PropViol, na.rm = TRUE),
+            meand_Crime = mean(d_crime, na.rm = TRUE),
+            countSales = n()) %>%
+  mutate(Legend="SalePrice") %>%
+  mutate(meansalePrice5NNOvermeansalePrice15NN = meansalePrice5NN/meansalePrice15NN) %>%
+  mutate(meansalePrice5NNperSqFtOvermeansalePrice5NN = meansalePrice5NNperSqFt/meansalePrice5NN) %>%
+  mutate(meansalePrice15NNperSqFtOvermeansalePrice15NN = meansalePrice15NNperSqFt/meansalePrice15NN) %>%
+  filter(countSales > 5) %>%
+  left_join(DavidsonCountyTracts, by = c("CensusBlock" = "censusTractNum")) %>%
+  st_sf()
+ggplot() + 
+  geom_sf(data=DavidsonCountyTracts, aes(), fill=NA, colour="black", size=2) +
+  geom_sf(data=train_and_test_student_mean_sale_price, aes(fill=countSales), colour="black") +
+  mapTheme()
+ggplot() + 
+  geom_sf(data=DavidsonCountyTracts, aes(), fill=NA, colour="black", size=2) +
+  geom_sf(data=train_and_test_student_mean_sale_price, aes(fill=meansalePrice), colour="black") +
+  mapTheme()
+```
+
+
+``` {r Map of other variables by Census Tract, echo=FALSE, include=FALSE, cache=TRUE}
+ggplot() + 
+  geom_sf(data=DavidsonCountyTracts, aes(), fill=NA, colour="black", size=2) +
+  geom_sf(data=train_and_test_student_mean_sale_price, aes(fill=meansalePrice5NN), colour="black") +
+  mapTheme()
+ggplot() + 
+  geom_sf(data=DavidsonCountyTracts, aes(), fill=NA, colour="black", size=2) +
+  geom_sf(data=train_and_test_student_mean_sale_price, aes(fill=meansalePrice15NN), colour="black") +
+  mapTheme()
+ggplot() + 
+  geom_sf(data=DavidsonCountyTracts, aes(), fill=NA, colour="black", size=2) +
+  geom_sf(data=train_and_test_student_mean_sale_price, aes(fill=meansalePrice5NNOvermeansalePrice15NN), colour="black") +
+  mapTheme()
+ggplot() + 
+  geom_sf(data=DavidsonCountyTracts, aes(), fill=NA, colour="black", size=2) +
+  geom_sf(data=train_and_test_student_mean_sale_price, aes(fill=meansalePrice5NNperSqFtOvermeansalePrice5NN), colour="black") +
+  mapTheme()
+ggplot() + 
+  geom_sf(data=DavidsonCountyTracts, aes(), fill=NA, colour="black", size=2) +
+  geom_sf(data=train_and_test_student_mean_sale_price, aes(fill=meansalePrice15NNperSqFtOvermeansalePrice15NN), colour="black") +
+  mapTheme()
+```
+
+##Interesting Predictors
+Following are maps of a few interesting spatial predictors
+
+###Year Constructed
+Below are maps of sales colored by the percentage of sold housing units that were built in each decade since the 1930s. East and near South Nashville have a prepondereance of older housing stock (30's and earlier).  Clearly, the 40s, 50s, and 60s saw extensive suburbanization, including an extensive period of building in the now poorer southeast Nashville, while the 80s saw a shift towards building in the now richer south-southwest Nashville.  The 90s saw building only on the exurban edge of southeast Nashville, while the 2000s have seen a shift towards the exurbs and a return to the favored southern Nashville.
+
+``` {r Map of Earlier than 30s built by Census Tract, echo=FALSE, include=TRUE, cache=TRUE}
+ggplot() + 
+  geom_sf(data=DavidsonCountyTracts, aes(), fill=NA, colour="black", size=2) +
+  geom_sf(data=train_and_test_student_mean_sale_price, aes(fill=meanearlierBuilt), colour="black") +
+  labs(fill = "Before 30s") +
+  mapTheme()
+```
+
+``` {r Map of 30sbuilt by Census Tract, echo=FALSE, include=TRUE, cache=TRUE}
+ggplot() + 
+  geom_sf(data=DavidsonCountyTracts, aes(), fill=NA, colour="black", size=2) +
+  geom_sf(data=train_and_test_student_mean_sale_price, aes(fill=mean30sBuilt), colour="black") +
+  labs(fill = "30s") +
+  mapTheme()
+```
+
+``` {r Map of 40sbuilt by Census Tract, echo=FALSE, include=TRUE, cache=TRUE}
+ggplot() + 
+  geom_sf(data=DavidsonCountyTracts, aes(), fill=NA, colour="black", size=2) +
+  geom_sf(data=train_and_test_student_mean_sale_price, aes(fill=mean40sBuilt), colour="black") +
+  labs(fill = "40s") +
+  mapTheme()
+```
+
+``` {r Map of 50sbuilt by Census Tract, echo=FALSE, include=TRUE, cache=TRUE}
+ggplot() + 
+  geom_sf(data=DavidsonCountyTracts, aes(), fill=NA, colour="black", size=2) +
+  geom_sf(data=train_and_test_student_mean_sale_price, aes(fill=mean50sBuilt), colour="black") +
+  labs(fill = "50s") +
+  mapTheme()
+```
+
+``` {r Map of 60sbuilt by Census Tract, echo=FALSE, include=TRUE, cache=TRUE}
+ggplot() + 
+  geom_sf(data=DavidsonCountyTracts, aes(), fill=NA, colour="black", size=2) +
+  geom_sf(data=train_and_test_student_mean_sale_price, aes(fill=mean60sBuilt), colour="black") +
+  labs(fill = "60s") +
+  mapTheme()
+```
+
+``` {r Map of 70sbuilt by Census Tract, echo=FALSE, include=TRUE, cache=TRUE}
+ggplot() + 
+  geom_sf(data=DavidsonCountyTracts, aes(), fill=NA, colour="black", size=2) +
+  geom_sf(data=train_and_test_student_mean_sale_price, aes(fill=mean70sBuilt), colour="black") +
+  labs(fill = "70s") +
+  mapTheme()
+```
+
+``` {r Map of 80sbuilt by Census Tract, echo=FALSE, include=TRUE, cache=TRUE}
+ggplot() + 
+  geom_sf(data=DavidsonCountyTracts, aes(), fill=NA, colour="black", size=2) +
+  geom_sf(data=train_and_test_student_mean_sale_price, aes(fill=mean80sBuilt), colour="black") +
+  labs(fill = "80s") +
+  mapTheme()
+```
+
+``` {r Map of 90sbuilt by Census Tract, echo=FALSE, include=TRUE, cache=TRUE}
+ggplot() + 
+  geom_sf(data=DavidsonCountyTracts, aes(), fill=NA, colour="black", size=2) +
+  geom_sf(data=train_and_test_student_mean_sale_price, aes(fill=mean90sBuilt), colour="black") +
+  labs(fill = "90s") +
+  mapTheme()
+```
+
+``` {r Map of 00sbuilt by Census Tract, echo=FALSE, include=TRUE, cache=TRUE}
+ggplot() + 
+  geom_sf(data=DavidsonCountyTracts, aes(), fill=NA, colour="black", size=2) +
+  geom_sf(data=train_and_test_student_mean_sale_price, aes(fill=mean00sBuilt), colour="black") +
+  labs(fill = "00s") +
+  mapTheme()
+```
+
+
+``` {r Map of central air conditioning by Census Tract, echo=FALSE, include=FALSE, cache=TRUE}
+ggplot() + 
+  geom_sf(data=DavidsonCountyTracts, aes(), fill=NA, colour="black", size=2) +
+  geom_sf(data=train_and_test_student_mean_sale_price, aes(fill=meanac_sfyi), colour="black") +
+  mapTheme()
+```
+
+###Distance to crime and property violations
+Below are maps displaying mean distance to the nearest five crimes and property violations respectively by tract.  Both tell a similar story.  In both maps, it is plainly evident that the southern Nashville neighborhoods possess the fewest crimes and violations, and houses sold here are on average farther from both of these disamenities.
+
+``` {r Map of distance to crime, echo=FALSE, include=TRUE, cache=TRUE}
+ggplot() + 
+  geom_sf(data=DavidsonCountyTracts, aes(), fill=NA, colour="black", size=2) +
+  geom_sf(data=train_and_test_student_mean_sale_price, aes(fill=meand_Crime), colour="black") +
+  labs(fill = "Distance to \n5 Nearest \nCrimes") +
+  mapTheme()
+```
+
+``` {r Map of distance to property violations, echo=FALSE, include=TRUE, cache=TRUE}
+ggplot() + 
+  geom_sf(data=DavidsonCountyTracts, aes(), fill=NA, colour="black", size=2) +
+  geom_sf(data=train_and_test_student_mean_sale_price, aes(fill=meand_PropViol), colour="black") +
+  labs(fill = "Distance to \n5 Nearest \nProperty Violations") +
+  mapTheme()
+```
+
+# Methods
+
+Our method is to divide our dataset of home sales into two subsets: a training set and a test set.  Using only data from the training set, we fit an ordinary least squares (OLS) model which best explains sale price as a function of our independent variables.  In short, this model is the best possible equation by which we can plug in values for known characteristics and receive a price estimate in return.
+
+We then test this model on the test set of data to see how well it works on new data.  This step is crucial to assure that we avoid overfitting, i.e. the problem of finding spurious relationships between individual characteristics and sale prices that are quirks of the particular sample that we train our model on.  To be especially sure we have not overfit, we repeat this process of subdividing and testing 99 more times.  Only then do we measure the accuracy of our model, by taking the average accuracy (R Squared, MAE, or MAPE) of each of the 100 tests.
+
+# Results
+## Polished Table of In Sample Training Set Model Results
+Below are the coefficients derived for all of the variables in our model.  Since we are reporting the results of our model derived from and applied to only our training set, we do not report our goodness of fit metrics (since to do so would violate the cardinal law of not testing a model on the same dataset it is trained on).  Our model includes many variables which are not all that significant, and some of which are collinear with one another.  Since this model's purpose is to maximize predictive accuracy rather than isolate causal relationships between any one variable and sale price, we are less concerned with the possiblity that some of the variables are presented as having falsely low p-values due to collinearity.  That said, there are some strikingly powerful predictors, most noticeably variations on the average sale prices of nearest neighboring sales.  Their clear significance is even more striking given the multicollinearity present in this model.
+
+``` {r polished table of in sample training set model results, echo=FALSE, include=TRUE, cache=TRUE}
+
+kable(xtable(regOntrain), digits = 3) %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"))
+```
+
+## Polished Table of Goodness of Fit Metrics for the Test Set
+
+Below are the goodness of fit metrics for one of the 100 trials that we ran during cross-validation.  In testing our model on this random subset of the data, we found an R Squared of 65%, meaning that we explained 65% of variation in sale prices in this test set.  We also found mean absolute error (MAE) and root mean squared error (RMSE) of 94 thousand and 153 thousand respectively.  These indicate that are model's sale price prediction is off on average by 94 or 153 thousand.  Note that the RMSE gives heavier weight to observations with larger errors, i.e. with larger differences between the actual and predicted sale price.  That our RMSE is so much larger than our MAE tells us that there is a large amount of variation in our observations' errors; that is, that some of our predictions are far "worse" from an accuracy standpoint, than others.  Note that these metrics are for only one of the trials on only one of the randomly selected test sets.  To get a sense of how the model performs on a consistent basis it is necessary to cross-validate. 
+
+``` {r polished test set table goodness of fit measures, echo=FALSE, include=TRUE, cache=TRUE}
+kable(t(lmFit$resample[2:2,])) %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"))
+```
+
+## Results of Cross-Validation
+
+The goodness of fit metrics for our cross-validated model are averages of the goodness of fit metrics found for each of the 100 tests we did on different randomly selected samples of sale observations.  The key numbers to look at here are our MAE and our MAE standard deviation.  The MAE is 100 thousand, telling us that on average our prediction is off by one hundred thousand dollars.  The MAE standard deviation is 19 thousand.  This tells us that in  roughly 68 percent of trials, our prediction will be off by between 81 thousand and 119 thousand, or 19 thousand more or less than our average amount of error (100 thousand).
+
+The histogram shows the distribution of R-squareds to be fairly normal; however, there is a disturbingly long tail on the left.  This suggests that for the most part, the accuracy of our model does not change too drastically as it is tested on different samples of new home prices, although there is a small minority of samplings of the dataset which can cause it to have exceedingly low predictive power.  For the most part our model is not overfitted (as the bulk of trials deliver a consistent R Square), however, this tail is worrying and a cause for future concern.
+
+``` {r results of CV on training set and histogram of Rsquareds for cross-validation, echo=FALSE, include=TRUE, cache=TRUE}
+kable(t(lmFit$results)) %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"))
+
+
+ggplot(as.data.frame(lmFit$resample), aes(Rsquared)) + 
+  geom_histogram(bins=20) +
+  labs(x="R-Squared",
+       y="Count")
+
+```
+
+## Predicted and Observed Prices
+Below are predicted prices as a function of observed prices.  This plot features observed prices on the Y-axis and predicted prices on the X-axis.  That the relationship appears positive and fairly linear tells us that our model is not horribly wrong; our model predicts higher prices for houses sold at higher prices and lower prices for houses sold at lower prices.  A perfectly accurate predictive model is represented by the black line; while there is some deviation, particularly on the right side of the line, for the most part our predictions fall close to the line. There does appear to be some heteroskedasticity, i.e. our model is farther off the mark for higher priced sales than lower prices sales.  In particular, our model tends to underpredict these higher priced sales.  Intuitively, this makes some sense -- given the scarcity of sales on the higher end of the price range, there are fewer similar sales for the model to train on, and as a result the prediction for these higher sale prices tends to be weakly supported.
+
+
+``` {r predicted and observed prices, echo=FALSE, include=TRUE, cache=TRUE, warning= FALSE}
+
+ggplot(regOnTrainValues, aes(x = observedSalePrice, y = predictedSalePrice)) +
+  geom_point() +
+  #geom_smooth(method = lm, se = FALSE) + 
+  xlab("Observed Sale Price") + ylab("Predicted Sale Price") +
+  geom_abline(intercept = 0, slope = 1)
+
+```
+
+## Map of Residuals
+
+Looking at our map of residuals can help us see if there are any geographic areas where we systematically over or under predict sales prices.  If there are, this means that we have failed to include some relevant variable which is sytematically throwing off our predictions.  Looking at this plot we can see that the most positive quintile of residuals, i.e. where we underpredicted by the largest amount, are clustered in the expensive neighborhood to the south-southwest.  However, on the whole, most of our residuals are distributed fairly evenly, and there are no overwhelming spatial patterns to the residuals.  This suggests that we accounted for most of the most glaring sources of spatial variation in sales prices.
+
+``` {r map of residuals , echo=FALSE, include=TRUE, cache=TRUE, fig.height = 15, fig.width = 15, fig.align = "center"}
+regOnTrainValues <- 
+  train_and_test_student %>%
+  dplyr::select(kenID, WGS1984X, WGS1984Y) %>%
+  right_join(regOnTrainValues,by = c("kenID"="test.kenID") )
+regOnTrainValues <- as.data.frame(filter(regOnTrainValues, is.na(error)==FALSE))
+
+ggplot() + 
+  geom_sf(data=DavidsonCountyTracts, aes(), fill='black', colour=NA) +
+  geom_point(data=regOnTrainValues, 
+             aes(WGS1984X,WGS1984Y, color=factor(ntile(error,5))),size=4, alpha = 10/10) +
+  xlab(" ") + ylab(" ") +
+  labs(fill = "Residuals \n (Quintiles)")
+
+
+```
+
+## Moran's I
+
+The Moran's I spatial autocorrelation statistic provides a more quantified way of examining what we eyeballed in the plot above.  Our Moran's I test comes with a p-value of .5, meaning we have a 50% chance of being wrong if we say that there is spatial autocorrelation (some spatial pattern to our residuals).  Essentially this test confirms that there is no significant spatial pattern in our residuals, i.e. our model does does not predict some areas better than others on a systematic basis.
+
+``` {r morans i , echo=FALSE, include=TRUE, cache=TRUE, warning=FALSE}
+
+testOnlyWithResiduals <-
+  test %>%
+  left_join(regOnTrainValues, by = c("kenID"="kenID") )
+testOnlyWithResiduals <- filter(testOnlyWithResiduals, is.na(testOnlyWithResiduals$error) == FALSE)
+
+coords <- cbind(testOnlyWithResiduals$WGS1984X.x, testOnlyWithResiduals$WGS1984Y.x)
+spatialWeights <- knn2nb(knearneigh(coords, 4))
+moran.test(testOnlyWithResiduals$error, nb2listw(spatialWeights, style="W"))
+
+```
+
+## Predicted Values for Entire Dataset
+
+After all of this, we can predict values for our entire dataset.  The map below shows just this, with sales divided into and colored on the basis of quintiles.  Clearly the highest predicted prices are in the south-southwest while the lowest prices are in the northwest and southeast.  This fits with the pattern of actual sales prices we observed in our past maps, and suggests that our predictions are largely in the ballpark.
+
+``` {r map of predicted values for entire dataset, echo=FALSE, include=TRUE, cache=TRUE}
+
+regOnAllValues <- 
+  data.frame(train_and_test_student$kenID,observedSalePrice = train_and_test_student$SalePrice,
+             predictedSalePrice = regOnAllPred)
+
+regOnAllValues <-
+  regOnAllValues %>%
+  filter(is.na(predictedSalePrice) == FALSE)%>%
+  mutate(error = predictedSalePrice - observedSalePrice) %>%
+  mutate(absError = abs(predictedSalePrice - observedSalePrice)) %>%
+  mutate(percentAbsError = abs(predictedSalePrice - observedSalePrice) / observedSalePrice) 
+
+regOnAllValues <- 
+  train_and_test_student %>%
+  dplyr::select(kenID, WGS1984X, WGS1984Y) %>%
+  right_join(regOnAllValues,by = c("kenID"="train_and_test_student.kenID") )
+regOnAllValues <- as.data.frame(filter(regOnAllValues, is.na(error)==FALSE))
+
+ggplot() + 
+  geom_sf(data=DavidsonCountyTracts, aes(), fill='white', colour="black", size=.5) +
+  geom_point(data=regOnAllValues, 
+             aes(WGS1984X,WGS1984Y, color=factor(ntile(predictedSalePrice,5))),size=1, alpha = 5/10) +
+  xlab(" ") + ylab("") +
+  labs(fill = "Predicted Sales \n(Quintiles)")
+```
+
+## Map of MAPE by Census Tract for Test Set Predictions
+
+Our next map shows mean absolute percentage error (MAPE) of our predictions, aggregated to the level of the tract.  Most tracts have an average MAPE of less than 1, telling us that our predictions in that tract were typically off by less than the average of price of the house sale in that tract.  This is a good sign.  There are, however, a couple of outliers which have MAPEs greater than 1.  For these tracts, our predictions are wildly off.
+
+Originally we intended to aggregate to the level of the Zip Code.  However, we encountered technical difficulty in wrangling the Zip Code spatial data, and chose, instead, to aggregate to the level of the census tract.
+
+``` {r, echo=FALSE, include=TRUE, cache=TRUE}
+regOnTrainValuesCensusTracts <-
+  train_and_test_student %>%
+  dplyr::select(kenID, SalePrice, CensusBlock) %>%
+  right_join(regOnTrainValues, by = c("kenID" = "kenID")) %>%
+  group_by(CensusBlock) %>%
+  summarize(meanSale = mean(SalePrice),
+            meanResidual = mean(error),
+            MAE = mean(absError),
+            MAPE = mean(percentAbsError),
+            countSales = n()) %>%
+  filter(countSales > 3) %>%
+  left_join(DavidsonCountyTracts, by = c("CensusBlock" = "censusTractNum")) 
+
+ggplot() + 
+  geom_sf(data=DavidsonCountyTracts, aes(), fill=NA, colour="black", size=2) +
+  geom_sf(data=regOnTrainValuesCensusTracts, aes(fill=MAPE), colour="black") +
+  mapTheme()
+```
+
+##MAPE by Census Tract as a Function of mean price
+
+Our last plot shows the relationship between MAPE and mean sale price on the tract level.  This plot shows that most tracts, with low and high mean sales prices, have MAPEs well below 1.  However, it is also evident that the few tracts whose MAPEs are tremendously large outliers are concentrated among those tracts with lower mean sale prices.  Given that there are far more tracts with low sales prices than high sales prices, it is difficult to tell how disproportionate this relationship truly is.  This could also be due to the inherent problems in using MAPE to assess goodness of fit of predictions on both very high and very low observaed values -- this problem will be discussed further in the Extra Credit section.
+
+``` {r MAPE as a function of sale price at tract level, echo=FALSE, include=TRUE, cache=TRUE}
+plot(x = regOnTrainValuesCensusTracts$meanSale, y = regOnTrainValuesCensusTracts$MAPE, xlab="Mean Sale Price", ylab = "Mean MAPE")
+
+```
+
+##Extra Credit: Spatial Cross-Validation on Neighborhoods of Different Socioeconomic Status
+
+We can then test our model's generalizability by cross-validating it specifically on neighborhoods of high, low, and medium socioeconomic status (as judged by mean sale price). If our model predicts better or worse in areas with higher or lower sales prices, this lets us know to be careful about where we apply it. When judging by two metrics of goodness of fit, MAPE and MAE, we find that our model's efficacy does differ in areas of high vs. low sales prices. The MAE is higher when predicting sale prices in rich neighborhoods than in poor neighborhoods, with middle price neighborhoods' MAE falling between them.  Conversely, the MAPE is higher in poor neighborhoods than in rich neighborhoods, with middle price neighborhoods once again falling between them.  
+
+This apparent contradiction actually makes sense intuitively.  In rich neighborhoods, prices have a much greater range than in poor neighborhoods.  It is possible to see prices in a rich neighborhood range from 500 thousand to several million, creating a price range in the millions.  Conversely, a poor neighborhood can only see prices fall so far, as there is a hard floor of zero.  The greater price range suggests that it is reasonable to see absolute measures of error such as MAE being much greater for rich neighborhood predictions than poor neighborhoods predictions.  Estimating within 100 thousand dollars of a multimillion dollar sale price is much harder than estimating within 100 thousand dollars of a hundred thousand sale price.
+
+Conversely, it is natural for MAPE to be much higher in poor neighborhoods than in rich neighborhoods.  Being off by 100 thousand on the multimillion dollar house would only marginally worsen the MAPE of that prediction, while being off by 100 thousand on the 100 thousand dollar house would increase the MAPE of that prediction to 100%. This problem is especially glaring in predicted values for several houses in the poorer neighborhood; these predicted values are below zero, which is an utterly absurd situation.
+
+Ultimately, this suggests the limitations of using MAPE and MAE to assess goodness of fit in predictive modeling of observations iwth both very high and very low values.   
+
+The code for this section can be found in an appendix at the end.
+
+``` {r Extra Credit, echo=FALSE, include=TRUE, cache=TRUE}
+####Extra credit_______________________
+trainingExceptRich <- dplyr::filter(onlyKnownData, onlyKnownData$CensusBlock != "37018601" & onlyKnownData$CensusBlock != "37018700" & onlyKnownData$CensusBlock != "37018602" & onlyKnownData$CensusBlock != "37017701" & onlyKnownData$CensusBlock != "37017702" & onlyKnownData$CensusBlock != "37018500" & onlyKnownData$CensusBlock != "37017901" & onlyKnownData$CensusBlock != "37017902" ) #the new training set
+testRich <- dplyr::filter(onlyKnownData, onlyKnownData$CensusBlock == "37018601" | onlyKnownData$CensusBlock == "37018700" | onlyKnownData$CensusBlock == "37018602" | onlyKnownData$CensusBlock == "37017701" | onlyKnownData$CensusBlock == "37017702" | onlyKnownData$CensusBlock == "37018500" | onlyKnownData$CensusBlock == "37017901" | onlyKnownData$CensusBlock == "37017902" )  #the new test set
+testRich <- dplyr::filter(testRich, is.na(testRich$pricePerSF) == FALSE)
+
+trainingExceptMiddle <- dplyr::filter(onlyKnownData, onlyKnownData$CensusBlock != "37011700" & onlyKnownData$CensusBlock != "37012100" & onlyKnownData$CensusBlock != "37012200" & onlyKnownData$CensusBlock != "37011900" & onlyKnownData$CensusBlock != "37019200" & onlyKnownData$CensusBlock != "37011600") #the new training set
+testMiddle <- dplyr::filter(onlyKnownData, onlyKnownData$CensusBlock == "37011700" | onlyKnownData$CensusBlock == "37012100" | onlyKnownData$CensusBlock == "37012200" | onlyKnownData$CensusBlock == "37011900" | onlyKnownData$CensusBlock == "37019200" | onlyKnownData$CensusBlock == "37011600")  #the new test set
+testMiddle <- dplyr::filter(testMiddle, is.na(testMiddle$pricePerSF) == FALSE)
+
+trainingExceptPoor <- dplyr::filter(onlyKnownData, onlyKnownData$CensusBlock != "37010903" & onlyKnownData$CensusBlock != "37010904" & onlyKnownData$CensusBlock != "37015613" & onlyKnownData$CensusBlock != "37015615" & onlyKnownData$CensusBlock != "37015617" & onlyKnownData$CensusBlock != "37015624" & onlyKnownData$CensusBlock != "37015629" & onlyKnownData$CensusBlock != "37015700"  & onlyKnownData$CensusBlock != "37015804" & onlyKnownData$CensusBlock != "37014800" & onlyKnownData$CensusBlock != "37012701" & onlyKnownData$CensusBlock != "37010701") #the new training set
+testPoor <- dplyr::filter(onlyKnownData, onlyKnownData$CensusBlock == "37010903" | onlyKnownData$CensusBlock == "37010904" | onlyKnownData$CensusBlock == "37015613" | onlyKnownData$CensusBlock == "37015615" | onlyKnownData$CensusBlock == "37015617" | onlyKnownData$CensusBlock == "37015624" | onlyKnownData$CensusBlock == "37015629" | onlyKnownData$CensusBlock == "37015700" | onlyKnownData$CensusBlock == "37015804" | onlyKnownData$CensusBlock == "37014800" | onlyKnownData$CensusBlock == "37012701" | onlyKnownData$CensusBlock == "37010701" )  #the new test set
+testPoor <- dplyr::filter(testPoor, is.na(testPoor$pricePerSF) == FALSE)
+
+#Derive new model from training set
+regOnRich <- lm(regFormula, data = trainingExceptRich, na.action = na.omit) #, na.action = na.omit
+regOnMiddle <- lm(regFormula, data = trainingExceptMiddle, na.action = na.omit) #, na.action = na.omit
+regOnPoor <- lm(regFormula, data = trainingExceptPoor, na.action = na.omit) #, na.action = na.omit
+
+#regOnTrainPredNew <- missingLevelsToNA(regOntrain,test)  #see function defined above
+
+#Tries out this new model on the test set
+regOnRichPred <- predict(regOnRich, testRich, na.action = na.omit) 
+regOnMiddlePred <- predict(regOnMiddle, testMiddle, na.action = na.omit) 
+regOnPoorPred <- predict(regOnPoor, testPoor, na.action = na.omit) 
+
+#calculating the mean absolute error
+regOnRichValues <- 
+  data.frame(testRich$kenID,observedSalePrice = testRich$SalePrice,
+             predictedSalePrice = regOnRichPred)
+regOnMiddleValues <- 
+  data.frame(testMiddle$kenID,observedSalePrice = testMiddle$SalePrice,
+             predictedSalePrice = regOnMiddlePred)
+regOnPoorValues <- 
+  data.frame(testPoor$kenID,observedSalePrice = testPoor$SalePrice,
+             predictedSalePrice = regOnPoorPred)
+regOnRichValues <-
+  regOnRichValues %>%
+  mutate(error = predictedSalePrice - observedSalePrice) %>%
+  mutate(absError = abs(predictedSalePrice - observedSalePrice)) %>%
+  mutate(percentAbsError = abs(predictedSalePrice - observedSalePrice) / observedSalePrice) %>%
+  mutate(Socioeconomic_Status = "Rich") %>%
+  mutate(kenID = testRich.kenID) %>%
+  dplyr::select(-testRich.kenID)
+regOnMiddleValues <-
+  regOnMiddleValues %>%
+  mutate(error = predictedSalePrice - observedSalePrice) %>%
+  mutate(absError = abs(predictedSalePrice - observedSalePrice)) %>%
+  mutate(percentAbsError = abs(predictedSalePrice - observedSalePrice) / observedSalePrice) %>%
+  mutate(Socioeconomic_Status = "Middle") %>%
+  mutate(kenID = testMiddle.kenID) %>%
+  dplyr::select(-testMiddle.kenID)
+regOnPoorValues <-
+  regOnPoorValues %>%
+  mutate(error = predictedSalePrice - observedSalePrice) %>%
+  mutate(absError = abs(predictedSalePrice - observedSalePrice)) %>%
+  mutate(percentAbsError = abs(predictedSalePrice - observedSalePrice) / observedSalePrice) %>%
+  mutate(Socioeconomic_Status = "Poor") %>%
+  mutate(kenID = testPoor.kenID) %>%
+  dplyr::select(-testPoor.kenID)
+
+regOnClassValues <- bind_rows(list(regOnRichValues,regOnMiddleValues,regOnPoorValues))
+
+tableMAEMAPERichPoorMiddle <- matrix(c(mean(regOnMiddleValues$percentAbsError),mean(regOnMiddleValues$absError),mean(regOnPoorValues$percentAbsError),mean(regOnPoorValues$absError),mean(regOnRichValues$percentAbsError),mean(regOnRichValues$absError)),ncol=2,byrow=TRUE)
+colnames(tableMAEMAPERichPoorMiddle) <- c("MAPE","MAE")
+rownames(tableMAEMAPERichPoorMiddle) <- c("Middle","Poor","Rich")
+tableMAEMAPERichPoorMiddle
+
+ggplot(regOnClassValues, aes(x = observedSalePrice, y = predictedSalePrice)) +
+  geom_point() +
+  #geom_smooth(method = lm, se = FALSE) + 
+  geom_abline(intercept = 0, slope = 1) +
+  facet_wrap( ~ Socioeconomic_Status, ncol=3, scales = "free")
+
+
+###______________
+```
+
+# Discussion
+
+As far as models go, this one is fairly, but not exceptionally effective.  It predicts better than a typical social-science regression, but a 100 thousand dollar MAE is nothing to write home about (or base an asking price off of) for a mean sale price of around 300 thousand dollars.  
+
+The most interesting variables were zip code (as a factor variable) and the varieties of average sale prices of nearby comparable housing units.  These two sets of variables delivered far and away the largest increases in predictive power. Using zip codes as a variable largely negated the need for broad demographic variables aggregated to census tracts because, given the degee to which wealth, education, income, race, and neighborhood are intertwined, accounting for zip code largely accounts for much of this broad level variation.  
+
+Remaining variation inside zip codes still needed to be accounted for, and, aside from obvious property characteristics such as acrage and square footage, averaging the sales prices of nearby comparable properties was the best way to achieve this.  To account for comparables in this way, we used several variations on this theme.  Our first set of predictors on this theme took the average sale price and price per square foot of the 5 nearest sales.  The next variation took average sale price and price per square foot for the 5 nearest sales *of the same type*, i.e. if the property was a residential condo, this measure would average the prices of the 5 nearest condo sales.  The last set of predictors in this theme repeated this process but for the 15 nearest sales of the same type.  Notably, coefficients on these measures were all heavily significant when applied in the model simultaneously, suggesting that even despite the potential multicollinearity created by this approach, each one of these variables told a deeply significant and compelling story which added to the predictive power of the model.  
+
+One of the strengths of this model is that it generalizes fairly well.  There is inherent difficulty in predicting high sales prices with the same level of absolute error as low sale prices -- which we attribute to the disproportionate presence of outliers on the high end of the sale price spectrum as well as the factors discussed in the Extra Credit section above.  As a result, our absolute errors are higher in the pricier neighborhoods of South Nashville.  This aside, our model generalizes fairly well throughout the neighborhoods of the city, as suggested by the fairly even geographic distribution of residuals and supported by the favorable Moran's I statistic. 
+
+# Conclusion
+
+On the whole, we would not present this particular model to Zillow as we feel there is still much more to be improved upon.  The most favorable avenue for improvement that we identify concerns the approximation of comparables.  While our variables relating to the average prices of nearby sales approximated the technique of comparable comparison, we see further ways to refine these variables by adding specificity, adjusting for density of housing units, and adjusting for natural or physical barriers by which "as-the-crow-flies" determination of nearest neighbors becomes a poor method of finding the most spatially proximate comparable sales. Beyond this, we see greater potential in using spatial lag or error models, or perhaps geographically weighted regression in the place of OLS, as much of the feature engineering with regard to the comparable technique is a clumsy approximation of what could be more efficiently done in these models.  Ultimately, we see this exercise as a useful learning experience in further refining our modeling attempts.
+
+
+#Appendix
+
+##Code for Extra Credit
+
+``` {r Extra Credit Code, echo=TRUE, include=TRUE, cache=TRUE}
+####Extra credit_______________________
+trainingExceptRich <- dplyr::filter(onlyKnownData, onlyKnownData$CensusBlock != "37018601" & onlyKnownData$CensusBlock != "37018700" & onlyKnownData$CensusBlock != "37018602" & onlyKnownData$CensusBlock != "37017701" & onlyKnownData$CensusBlock != "37017702" & onlyKnownData$CensusBlock != "37018500" & onlyKnownData$CensusBlock != "37017901" & onlyKnownData$CensusBlock != "37017902" ) #the new training set
+testRich <- dplyr::filter(onlyKnownData, onlyKnownData$CensusBlock == "37018601" | onlyKnownData$CensusBlock == "37018700" | onlyKnownData$CensusBlock == "37018602" | onlyKnownData$CensusBlock == "37017701" | onlyKnownData$CensusBlock == "37017702" | onlyKnownData$CensusBlock == "37018500" | onlyKnownData$CensusBlock == "37017901" | onlyKnownData$CensusBlock == "37017902" )  #the new test set
+testRich <- dplyr::filter(testRich, is.na(testRich$pricePerSF) == FALSE)
+
+trainingExceptMiddle <- dplyr::filter(onlyKnownData, onlyKnownData$CensusBlock != "37011700" & onlyKnownData$CensusBlock != "37012100" & onlyKnownData$CensusBlock != "37012200" & onlyKnownData$CensusBlock != "37011900" & onlyKnownData$CensusBlock != "37019200" & onlyKnownData$CensusBlock != "37011600") #the new training set
+testMiddle <- dplyr::filter(onlyKnownData, onlyKnownData$CensusBlock == "37011700" | onlyKnownData$CensusBlock == "37012100" | onlyKnownData$CensusBlock == "37012200" | onlyKnownData$CensusBlock == "37011900" | onlyKnownData$CensusBlock == "37019200" | onlyKnownData$CensusBlock == "37011600")  #the new test set
+testMiddle <- dplyr::filter(testMiddle, is.na(testMiddle$pricePerSF) == FALSE)
+
+trainingExceptPoor <- dplyr::filter(onlyKnownData, onlyKnownData$CensusBlock != "37010903" & onlyKnownData$CensusBlock != "37010904" & onlyKnownData$CensusBlock != "37015613" & onlyKnownData$CensusBlock != "37015615" & onlyKnownData$CensusBlock != "37015617" & onlyKnownData$CensusBlock != "37015624" & onlyKnownData$CensusBlock != "37015629" & onlyKnownData$CensusBlock != "37015700"  & onlyKnownData$CensusBlock != "37015804" & onlyKnownData$CensusBlock != "37014800" & onlyKnownData$CensusBlock != "37012701" & onlyKnownData$CensusBlock != "37010701") #the new training set
+testPoor <- dplyr::filter(onlyKnownData, onlyKnownData$CensusBlock == "37010903" | onlyKnownData$CensusBlock == "37010904" | onlyKnownData$CensusBlock == "37015613" | onlyKnownData$CensusBlock == "37015615" | onlyKnownData$CensusBlock == "37015617" | onlyKnownData$CensusBlock == "37015624" | onlyKnownData$CensusBlock == "37015629" | onlyKnownData$CensusBlock == "37015700" | onlyKnownData$CensusBlock == "37015804" | onlyKnownData$CensusBlock == "37014800" | onlyKnownData$CensusBlock == "37012701" | onlyKnownData$CensusBlock == "37010701" )  #the new test set
+testPoor <- dplyr::filter(testPoor, is.na(testPoor$pricePerSF) == FALSE)
+
+#Derive new model from training set
+regOnRich <- lm(regFormula, data = trainingExceptRich, na.action = na.omit) #, na.action = na.omit
+regOnMiddle <- lm(regFormula, data = trainingExceptMiddle, na.action = na.omit) #, na.action = na.omit
+regOnPoor <- lm(regFormula, data = trainingExceptPoor, na.action = na.omit) #, na.action = na.omit
+
+#regOnTrainPredNew <- missingLevelsToNA(regOntrain,test)  #see function defined above
+
+#Tries out this new model on the test set
+regOnRichPred <- predict(regOnRich, testRich, na.action = na.omit) 
+regOnMiddlePred <- predict(regOnMiddle, testMiddle, na.action = na.omit) 
+regOnPoorPred <- predict(regOnPoor, testPoor, na.action = na.omit) 
+
+#calculating the mean absolute error
+regOnRichValues <- 
+  data.frame(testRich$kenID,observedSalePrice = testRich$SalePrice,
+             predictedSalePrice = regOnRichPred)
+regOnMiddleValues <- 
+  data.frame(testMiddle$kenID,observedSalePrice = testMiddle$SalePrice,
+             predictedSalePrice = regOnMiddlePred)
+regOnPoorValues <- 
+  data.frame(testPoor$kenID,observedSalePrice = testPoor$SalePrice,
+             predictedSalePrice = regOnPoorPred)
+regOnRichValues <-
+  regOnRichValues %>%
+  mutate(error = predictedSalePrice - observedSalePrice) %>%
+  mutate(absError = abs(predictedSalePrice - observedSalePrice)) %>%
+  mutate(percentAbsError = abs(predictedSalePrice - observedSalePrice) / observedSalePrice) %>%
+  mutate(Socioeconomic_Status = "Rich") %>%
+  mutate(kenID = testRich.kenID) %>%
+  dplyr::select(-testRich.kenID)
+regOnMiddleValues <-
+  regOnMiddleValues %>%
+  mutate(error = predictedSalePrice - observedSalePrice) %>%
+  mutate(absError = abs(predictedSalePrice - observedSalePrice)) %>%
+  mutate(percentAbsError = abs(predictedSalePrice - observedSalePrice) / observedSalePrice) %>%
+  mutate(Socioeconomic_Status = "Middle") %>%
+  mutate(kenID = testMiddle.kenID) %>%
+  dplyr::select(-testMiddle.kenID)
+regOnPoorValues <-
+  regOnPoorValues %>%
+  mutate(error = predictedSalePrice - observedSalePrice) %>%
+  mutate(absError = abs(predictedSalePrice - observedSalePrice)) %>%
+  mutate(percentAbsError = abs(predictedSalePrice - observedSalePrice) / observedSalePrice) %>%
+  mutate(Socioeconomic_Status = "Poor") %>%
+  mutate(kenID = testPoor.kenID) %>%
+  dplyr::select(-testPoor.kenID)
+
+regOnClassValues <- bind_rows(list(regOnRichValues,regOnMiddleValues,regOnPoorValues))
+
+tableMAEMAPERichPoorMiddle <- matrix(c(mean(regOnMiddleValues$percentAbsError),mean(regOnMiddleValues$absError),mean(regOnPoorValues$percentAbsError),mean(regOnPoorValues$absError),mean(regOnRichValues$percentAbsError),mean(regOnRichValues$absError)),ncol=2,byrow=TRUE)
+colnames(tableMAEMAPERichPoorMiddle) <- c("MAPE","MAE")
+rownames(tableMAEMAPERichPoorMiddle) <- c("Middle","Poor","Rich")
+tableMAEMAPERichPoorMiddle
+
+ggplot(regOnClassValues, aes(x = observedSalePrice, y = predictedSalePrice)) +
+  geom_point() +
+  #geom_smooth(method = lm, se = FALSE) + 
+  geom_abline(intercept = 0, slope = 1) +
+  facet_wrap( ~ Socioeconomic_Status, ncol=3, scales = "free")
+
+
+```
+
+
